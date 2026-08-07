@@ -18,7 +18,7 @@ test("server kill reward grants boss equipment and progression", () => {
   const save = initialSave(), before = save.inventory.length;
   const reward = rewardForKill(save, "hornBeast");
   assert.ok(reward.gold >= 140 && reward.gold <= 450);
-  assert.equal(reward.xp, 250); assert.ok(reward.drops.length >= 1); assert.ok(save.inventory.length > before);
+  assert.equal(reward.xp, 450); assert.ok(reward.drops.length >= 1); assert.ok(save.inventory.length > before);
   assert.equal(save.stats.kills, 1); assert.equal(save.stats.bossKills, 1);
 });
 

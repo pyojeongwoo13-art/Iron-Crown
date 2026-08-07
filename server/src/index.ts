@@ -9,6 +9,7 @@ import helmet from "helmet";
 import { Server } from "socket.io";
 import { z } from "zod";
 import { createToken, requireAuth, verifyToken, type AuthUser } from "./auth.js";
+import { createBossEngine, type BossPresence } from "./boss-engine.js";
 import { initializeDatabase, pool } from "./db.js";
 import { buyFromShop, enhanceOnServer, loadSave, mergeClientState, rewardForKill, writeSave } from "./game.js";
 import { initialSave, MONSTERS } from "../../client/src/game/content.js";
@@ -65,12 +66,13 @@ app.post("/api/save", requireAuth, async (request, response) => {
 app.post("/api/game/kill", requireAuth, async (request, response) => {
   const monsterId = typeof request.body?.monsterId === "string" ? request.body.monsterId : "";
   const monster = MONSTERS[monsterId]; if (!monster) return response.status(400).json({ error: "알 수 없는 몬스터입니다." });
+  if (monster.kind === "boss") return response.status(409).json({ error: "보스 처치와 보상은 서버 전투 인스턴스에서만 확정됩니다." });
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const save = await loadSave(client, request.user!.id, true);
     const claim = await client.query("SELECT claimed_at FROM reward_claims WHERE user_id=$1 AND monster_id=$2 FOR UPDATE", [request.user!.id, monsterId]);
-    const last = claim.rows[0] ? new Date(claim.rows[0].claimed_at).getTime() : 0, minimum = monster.kind === "boss" ? 8_000 : monster.kind === "elite" ? 2_500 : 350;
+    const last = claim.rows[0] ? new Date(claim.rows[0].claimed_at).getTime() : 0, minimum = monster.kind === "elite" ? 2_500 : 350;
     if (Date.now() - last < minimum) throw new Error("보상 요청이 너무 빠릅니다.");
     const reward = rewardForKill(save, monsterId); await writeSave(client, request.user!.id, save);
     await client.query("INSERT INTO reward_claims(user_id,monster_id,claimed_at) VALUES($1,$2,NOW()) ON CONFLICT(user_id,monster_id) DO UPDATE SET claimed_at=NOW()", [request.user!.id, monsterId]);
@@ -93,17 +95,45 @@ app.post("/api/game/shop", requireAuth, async (request, response) => {
   finally { client.release(); }
 });
 
-type Presence = { id: string; name: string; x: number; y: number; hp: number; maxHp: number; weapon: string; region: string; updatedAt: number };
+type Presence = BossPresence & { id: string; maxHp: number; weapon: string };
 const presence = new Map<string, Presence>();
 const io = new Server(server, { cors: { origin: origins.includes("*") ? true : origins, methods: ["GET", "POST"] }, pingInterval: 10_000, pingTimeout: 20_000 });
+const bossEngine = createBossEngine({
+  io,
+  getPresence: () => [...presence.values()],
+  onDefeat: async (bossId, contributors) => {
+    for (const contributor of contributors) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const save = await loadSave(client, contributor.userId, true);
+        const reward = rewardForKill(save, bossId);
+        await writeSave(client, contributor.userId, save);
+        await client.query("INSERT INTO reward_claims(user_id,monster_id,claimed_at) VALUES($1,$2,NOW()) ON CONFLICT(user_id,monster_id) DO UPDATE SET claimed_at=NOW()", [contributor.userId, bossId]);
+        await client.query("COMMIT");
+        io.to(contributor.socketId).emit("boss:reward", { bossId, save, reward });
+      } catch (error) {
+        await client.query("ROLLBACK");
+        io.to(contributor.socketId).emit("boss:reward-error", { bossId, error: error instanceof Error ? error.message : "보상을 처리하지 못했습니다." });
+      } finally { client.release(); }
+    }
+  },
+});
 io.use((socket, next) => { try { socket.data.user = verifyToken(String(socket.handshake.auth?.token ?? "")); next(); } catch { next(new Error("unauthorized")); } });
 io.on("connection", (socket) => {
   const user = socket.data.user as AuthUser;
   socket.on("presence", (raw: Record<string, unknown>) => {
     const number = (value: unknown, fallback: number, min: number, max: number) => Math.min(max, Math.max(min, typeof value === "number" && Number.isFinite(value) ? value : fallback));
-    presence.set(socket.id, { id: socket.id, name: user.displayName, x: number(raw.x, 520, 0, 4600), y: number(raw.y, 1400, 0, 2800), hp: number(raw.hp, 1, 0, 1e12), maxHp: number(raw.maxHp, 100, 1, 1e12), weapon: typeof raw.weapon === "string" ? raw.weapon.slice(0, 90) : "맨손", region: typeof raw.region === "string" ? raw.region.slice(0, 20) : "meadow", updatedAt: Date.now() });
+    const previous = presence.get(socket.id), now = Date.now(), x = number(raw.x, 520, 0, 4600), y = number(raw.y, 1400, 0, 2800), region = typeof raw.region === "string" ? raw.region.slice(0, 20) : "meadow";
+    const elapsed = Math.max(.05, Math.min(.6, (now - (previous?.updatedAt ?? now)) / 1000));
+    presence.set(socket.id, { id: socket.id, socketId: socket.id, userId: user.id, name: user.displayName, x, y,
+      vx: previous?.region === region ? (x - previous.x) / elapsed : 0, vy: previous?.region === region ? (y - previous.y) / elapsed : 0,
+      hp: number(raw.hp, 1, 0, 1e12), maxHp: number(raw.maxHp, 100, 1, 1e12), weapon: typeof raw.weapon === "string" ? raw.weapon.slice(0, 90) : "맨손", region, updatedAt: now });
+    if (!previous || previous.region !== region) bossEngine.joinRegion(socket.id, previous?.region ?? null, region);
     io.emit("world", [...presence.values()]);
   });
+  socket.on("boss:engage", (raw: Record<string, unknown>) => bossEngine.engage(socket.id, typeof raw?.regionId === "string" ? raw.regionId : ""));
+  socket.on("boss:damage", (raw: unknown) => bossEngine.damage(socket.id, raw));
   socket.on("disconnect", () => { presence.delete(socket.id); io.emit("world", [...presence.values()]); });
 });
 
