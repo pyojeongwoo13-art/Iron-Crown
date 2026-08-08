@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 import type { Server } from "socket.io";
 import { BOSS_DEFINITIONS, bossPhase, patternsFor, type BossPattern, type BossStep, type BossShape } from "../../client/src/game/bosses.js";
 import { MONSTERS, REGIONS } from "../../client/src/game/content.js";
+import { NETWORK } from "../../client/src/game/network.js";
+import { bossDamageAfterDefense } from "../../client/src/game/combat.js";
 
 const ARENA = { x: 3570, y: 650, w: 820, h: 1100 };
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const distance = (a: { x: number; y: number }, b: { x: number; y: number }) => Math.hypot(a.x - b.x, a.y - b.y);
 const angleDelta = (a: number, b: number) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
+function compactInPlace<T>(items: T[], keep: (item: T) => boolean, max = Infinity) { let write = 0; for (let read = 0; read < items.length; read += 1) if (keep(items[read])) items[write++] = items[read]; items.length = write; if (items.length > max) items.splice(0, items.length - max); }
 
 export type BossPresence = {
   socketId: string;
@@ -73,10 +76,12 @@ type BossRuntime = {
   vulnerableUntil: number;
   armor: number;
   armorMax: number;
-  contributors: Map<string, string>;
+  contributors: Map<string, { socketId: string; damage: number; lastHitAt: number }>;
   effects: BossEffect[];
   pendingSteps: Array<{ at: number; pattern: BossPattern; step: BossStep }>;
   phaseSpecials: Set<string>;
+  pendingDamage: number;
+  damageBroadcastAt: number;
 };
 
 export type BossSnapshot = {
@@ -112,7 +117,7 @@ function makeRuntime(regionId: string, bossId: string): BossRuntime {
     regionId, bossId, x: ARENA.x + ARENA.w * .55, y: ARENA.y + ARENA.h * .52,
     hp: monster.hp, maxHp: monster.hp, phase: 1, alive: true, engaged: false, respawnAt: 0,
     targetId: null, retargetAt: 0, nextPatternAt: 0, patternUntil: 0, patternId: null, patternName: null,
-    recentPatterns: [], vulnerableUntil: 0, armor: 0, armorMax, contributors: new Map(), effects: [], pendingSteps: [], phaseSpecials: new Set(),
+    recentPatterns: [], vulnerableUntil: 0, armor: 0, armorMax, contributors: new Map(), effects: [], pendingSteps: [], phaseSpecials: new Set(), pendingDamage: 0, damageBroadcastAt: 0,
   };
 }
 
@@ -150,14 +155,11 @@ function weightedPick(patterns: BossPattern[], recent: string[]) {
 export function createBossEngine({ io, getPresence, onDefeat }: EngineOptions) {
   const runtimes = new Map(REGIONS.map((region) => [region.id, makeRuntime(region.id, region.bossId)]));
   const damageThrottle = new Map<string, number>();
+  const metrics = { ticks: 0, bossSnapshots: 0, bossPatterns: 0, bossDamageBatches: 0, effectsResolved: 0, acceptedPlayerHits: 0, acceptedPlayerDamage: 0 };
 
-  const playersFor = (runtime: BossRuntime) => getPresence().filter((player) => player.region === runtime.regionId && player.hp > 0 && Date.now() - player.updatedAt < 2_000 && insideArena(player));
-  const targetFor = (runtime: BossRuntime) => getPresence().find((player) => player.socketId === runtime.targetId) ?? null;
-
-  function chooseTarget(runtime: BossRuntime, now: number) {
-    const players = playersFor(runtime);
+  function chooseTarget(runtime: BossRuntime, now: number, players: BossPresence[]) {
     if (!players.length) { runtime.targetId = null; return null; }
-    const current = targetFor(runtime);
+    const current = players.find((player) => player.socketId === runtime.targetId) ?? null;
     if (current && now < runtime.retargetAt && insideArena(current)) return current;
     const sorted = players.sort((a, b) => distance(a, runtime) - distance(b, runtime));
     const pool = sorted.slice(0, Math.min(3, sorted.length));
@@ -226,13 +228,13 @@ export function createBossEngine({ io, getPresence, onDefeat }: EngineOptions) {
   }
 
   function flushPendingSteps(runtime: BossRuntime, target: BossPresence, now: number) {
-    const due = runtime.pendingSteps.filter((item) => item.at <= now), future = runtime.pendingSteps.filter((item) => item.at > now);
-    runtime.pendingSteps = future;
-    for (const item of due) {
+    for (const item of runtime.pendingSteps) if (item.at <= now) {
       const effects = expandStep(runtime, target, item.pattern, item.step, item.at - item.step.at);
       runtime.effects.push(...effects);
       io.to(`region:${runtime.regionId}`).emit("boss:pattern", { boss: snapshot(runtime), effects: effects.map(({ hitKeys: _hitKeys, ...effect }) => effect) });
+      metrics.bossPatterns += 1;
     }
+    compactInPlace(runtime.pendingSteps, (item) => item.at > now);
   }
 
   function resetRuntime(runtime: BossRuntime, now: number) {
@@ -240,12 +242,11 @@ export function createBossEngine({ io, getPresence, onDefeat }: EngineOptions) {
     Object.assign(runtime, fresh, { nextPatternAt: now + 1_400 });
   }
 
-  function tickRuntime(runtime: BossRuntime, now: number, dt: number) {
+  function tickRuntime(runtime: BossRuntime, now: number, dt: number, players: BossPresence[]) {
     if (!runtime.alive) {
-      if (now >= runtime.respawnAt) resetRuntime(runtime, now);
+      if (now >= runtime.respawnAt) { resetRuntime(runtime, now); io.to(`region:${runtime.regionId}`).emit("boss:state", snapshot(runtime)); metrics.bossSnapshots += 1; }
       return;
     }
-    const players = playersFor(runtime);
     if (!players.length) {
       runtime.engaged = false; runtime.targetId = null; runtime.patternId = null; runtime.patternName = null; runtime.effects = []; runtime.pendingSteps = [];
       const home = { x: ARENA.x + ARENA.w * .55, y: ARENA.y + ARENA.h * .52 };
@@ -253,7 +254,7 @@ export function createBossEngine({ io, getPresence, onDefeat }: EngineOptions) {
       return;
     }
     runtime.engaged = true;
-    const target = chooseTarget(runtime, now);
+    const target = chooseTarget(runtime, now, players);
     if (!target) return;
     const nextPhase = bossPhase(runtime.bossId, runtime.hp / runtime.maxHp);
     if (nextPhase !== runtime.phase) {
@@ -281,6 +282,7 @@ export function createBossEngine({ io, getPresence, onDefeat }: EngineOptions) {
     for (const effect of runtime.effects) {
       if (!effect.resolved && now >= effect.resolveAt) {
         effect.resolved = true;
+        metrics.effectsResolved += 1;
         if (effect.move !== "none") {
           const destinationX = effect.shape === "line" ? effect.x + Math.cos(effect.angle) * Math.min(effect.range, 520) : effect.x;
           const destinationY = effect.shape === "line" ? effect.y + Math.sin(effect.angle) * Math.min(effect.range, 520) : effect.y;
@@ -300,13 +302,17 @@ export function createBossEngine({ io, getPresence, onDefeat }: EngineOptions) {
         effect.nextHitAt += effect.repeat > 0 ? effect.repeat : Math.max(1_000_000, effect.expiresAt - effect.resolveAt + 1);
       }
     }
-    runtime.effects = runtime.effects.filter((effect) => now <= effect.expiresAt + 350).slice(-80);
+    compactInPlace(runtime.effects, (effect) => now <= effect.expiresAt + 350, 80);
+    if (runtime.pendingDamage > 0 && now >= runtime.damageBroadcastAt) {
+      io.to(`region:${runtime.regionId}`).emit("boss:damage", { bossId: runtime.bossId, hp: runtime.hp, amount: runtime.pendingDamage });
+      runtime.pendingDamage = 0; runtime.damageBroadcastAt = now + 1000 / NETWORK.bossDamageBroadcastHz; metrics.bossDamageBatches += 1;
+    }
   }
 
   async function defeat(runtime: BossRuntime, now: number) {
     runtime.hp = 0; runtime.alive = false; runtime.engaged = false; runtime.effects = []; runtime.pendingSteps = []; runtime.patternId = null; runtime.patternName = null;
     runtime.respawnAt = now + MONSTERS[runtime.bossId].respawn * 1000;
-    const contributors = [...runtime.contributors].map(([userId, socketId]) => ({ userId, socketId }));
+    const contributors = [...runtime.contributors].map(([userId, entry]) => ({ userId, socketId: entry.socketId }));
     io.to(`region:${runtime.regionId}`).emit("boss:defeated", snapshot(runtime));
     try { await onDefeat(runtime.bossId, contributors); } catch (error) { console.error("boss reward failed", error); }
   }
@@ -320,16 +326,22 @@ export function createBossEngine({ io, getPresence, onDefeat }: EngineOptions) {
     if (now - (damageThrottle.get(throttleKey) ?? 0) < 105) return;
     damageThrottle.set(throttleKey, now);
     const requested = typeof body.damage === "number" && Number.isFinite(body.damage) ? Math.max(1, body.damage) : 1;
-    let amount = Math.min(requested, runtime.maxHp * .025);
+    // 예전의 maxHp * 2.5% 상한은 성장한 공격력을 1지역 38/2지역 150처럼 고정시켰다.
+    // 비정상적으로 큰 입력만 안전 한도로 거르고, 정상 피해는 보스 방어 등급 공식으로 계산한다.
+    const safetyLimited = Math.min(requested, runtime.maxHp * 10);
+    let amount = bossDamageAfterDefense(safetyLimited, MONSTERS[runtime.bossId].tier).final;
     if (runtime.bossId === "mineGuardian" && runtime.phase >= 2 && runtime.armor > 0) {
       const armorDamage = Math.min(runtime.armor, amount); runtime.armor -= armorDamage; amount *= .38;
       if (runtime.armor <= 0) runtime.vulnerableUntil = now + 3_000;
     }
     if (now < runtime.vulnerableUntil) amount *= runtime.bossId === "forgeLord" ? 1.35 : 1.22;
     if (runtime.bossId === "frozenColossus" && runtime.phase >= 3) amount *= 1.18;
-    runtime.hp = Math.max(0, runtime.hp - Math.round(amount));
-    runtime.contributors.set(player.userId, socketId);
-    io.to(`region:${regionId}`).emit("boss:damage", { bossId: runtime.bossId, hp: runtime.hp, amount: Math.round(amount), by: socketId });
+    const dealt = Math.max(1, Math.round(amount));
+    runtime.hp = Math.max(0, runtime.hp - dealt);
+    const contribution = runtime.contributors.get(player.userId);
+    runtime.contributors.set(player.userId, { socketId, damage: (contribution?.damage ?? 0) + dealt, lastHitAt: now });
+    runtime.pendingDamage += dealt;
+    metrics.acceptedPlayerHits += 1; metrics.acceptedPlayerDamage += dealt;
     if (runtime.hp <= 0) void defeat(runtime, now);
   }
 
@@ -341,22 +353,35 @@ export function createBossEngine({ io, getPresence, onDefeat }: EngineOptions) {
     io.to(socketId).emit("boss:state", snapshot(runtime));
   }
 
-  function joinRegion(socketId: string, previous: string | null, regionId: string) {
+  async function joinRegion(socketId: string, previous: string | null, regionId: string) {
     const socket = io.sockets.sockets.get(socketId); if (!socket) return;
-    if (previous) void socket.leave(`region:${previous}`);
-    void socket.join(`region:${regionId}`);
+    if (previous) await socket.leave(`region:${previous}`);
+    await socket.join(`region:${regionId}`);
     const runtime = runtimes.get(regionId); if (runtime) io.to(socketId).emit("boss:state", snapshot(runtime));
+  }
+
+  function removePlayer(socketId: string) {
+    for (const key of damageThrottle.keys()) if (key.startsWith(`${socketId}:`)) damageThrottle.delete(key);
+    for (const runtime of runtimes.values()) {
+      if (runtime.targetId === socketId) { runtime.targetId = null; runtime.retargetAt = 0; }
+    }
   }
 
   let last = Date.now(), broadcastAt = 0;
   const timer = setInterval(() => {
-    const now = Date.now(), dt = Math.min(.08, (now - last) / 1000); last = now;
-    for (const runtime of runtimes.values()) tickRuntime(runtime, now, dt);
-    if (now >= broadcastAt) {
-      broadcastAt = now + 100;
-      for (const runtime of runtimes.values()) io.to(`region:${runtime.regionId}`).emit("boss:state", snapshot(runtime));
+    const now = Date.now(), dt = Math.min(.08, (now - last) / 1000), allPlayers = getPresence(), byRegion = new Map<string, BossPresence[]>(); last = now; metrics.ticks += 1;
+    for (const player of allPlayers) { const group = byRegion.get(player.region) ?? []; group.push(player); byRegion.set(player.region, group); }
+    for (const runtime of runtimes.values()) {
+      const players = (byRegion.get(runtime.regionId) ?? []).filter((player) => player.hp > 0 && now - player.updatedAt < 2_000 && insideArena(player));
+      tickRuntime(runtime, now, dt, players);
     }
-  }, 50);
+    if (now >= broadcastAt) {
+      broadcastAt = now + 1000 / NETWORK.bossSnapshotHz;
+      for (const runtime of runtimes.values()) if (runtime.engaged && io.sockets.adapter.rooms.get(`region:${runtime.regionId}`)?.size) {
+        io.to(`region:${runtime.regionId}`).emit("boss:state", snapshot(runtime)); metrics.bossSnapshots += 1;
+      }
+    }
+  }, 1000 / NETWORK.bossSimulationHz);
 
-  return { damage, engage, joinRegion, stop: () => clearInterval(timer), snapshotFor: (regionId: string) => { const runtime = runtimes.get(regionId); return runtime ? snapshot(runtime) : null; } };
+  return { damage, engage, joinRegion, removePlayer, stop: () => clearInterval(timer), getMetrics: () => ({ ...metrics }), snapshotFor: (regionId: string) => { const runtime = runtimes.get(regionId); return runtime ? snapshot(runtime) : null; } };
 }

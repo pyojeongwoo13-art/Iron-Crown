@@ -31,16 +31,22 @@ assert.equal(forbiddenBoss.status, 409);
 
 const socketA = io(base, { auth: { token: first.token }, transports: ["websocket"] });
 const socketB = io(base, { auth: { token: second.token }, transports: ["websocket"] });
-const sendA = () => socketA.emit("presence", { x: 3820, y: 1200, hp: 100, maxHp: 100, weapon: "낡은 장검", region: "meadow" });
-const sendB = () => socketB.emit("presence", { x: 3890, y: 1280, hp: 100, maxHp: 100, weapon: "낡은 장검", region: "meadow" });
+let movementFrame = 0;
+const counts = { roster:0, snapshots:0, bossStates:0, bossDamageBatches:0, bossPatterns:0, bossPhases:0 };
+for (const socket of [socketA,socketB]) {
+  socket.on("world:roster",()=>counts.roster+=1);socket.on("world:snapshot",()=>counts.snapshots+=1);
+  socket.on("boss:state",()=>counts.bossStates+=1);socket.on("boss:damage",()=>counts.bossDamageBatches+=1);socket.on("boss:pattern",()=>counts.bossPatterns+=1);socket.on("boss:phase",()=>counts.bossPhases+=1);
+}
+const sendA = () => socketA.emit("presence", { x: 3820+(movementFrame%7), y: 1200, hp: 100, maxHp: 100, weapon: "낡은 장검", level:1, region: "meadow" });
+const sendB = () => socketB.emit("presence", { x: 3890-(movementFrame%7), y: 1280, hp: 100, maxHp: 100, weapon: "낡은 장검", level:1, region: "meadow" });
 const presenceCheck = new Promise((resolve, reject) => {
   const timeout = setTimeout(() => reject(new Error("Socket.IO presence timeout")), 5_000);
   const inspect = (players) => { if (players.length >= 2) { clearTimeout(timeout); resolve(players); } };
-  socketA.on("world", inspect); socketB.on("world", inspect);
+  socketA.on("world:roster", inspect); socketB.on("world:roster", inspect);
   socketA.on("connect", sendA); socketB.on("connect", sendB);
 });
 await presenceCheck;
-const presenceTimer = setInterval(() => { sendA(); sendB(); }, 180);
+const presenceTimer = setInterval(() => { movementFrame+=1;sendA();sendB(); }, 1000/15);
 socketA.emit("boss:engage", { regionId: "meadow" }); socketB.emit("boss:engage", { regionId: "meadow" });
 const bossRewards = new Promise((resolve, reject) => {
   const rewards = new Map(), timeout = setTimeout(() => reject(new Error("server boss reward timeout")), 12_000);
@@ -48,17 +54,22 @@ const bossRewards = new Promise((resolve, reject) => {
   socketA.on("boss:reward", collect("a")); socketB.on("boss:reward", collect("b"));
   socketA.on("boss:reward-error", reject); socketB.on("boss:reward-error", reject);
 });
-const damageTimer = setInterval(() => { socketA.emit("boss:damage", { regionId: "meadow", damage: 999_999 }); socketB.emit("boss:damage", { regionId: "meadow", damage: 999_999 }); }, 120);
+await new Promise(resolve=>setTimeout(resolve,1_800));
+const damageTimer = setInterval(() => { socketA.emit("boss:damage", { regionId: "meadow", damage: 200 }); socketB.emit("boss:damage", { regionId: "meadow", damage: 200 }); }, 120);
 const rewards = await bossRewards; clearInterval(damageTimer); clearInterval(presenceTimer);
 const heroBoss = rewards.get("a"); assert.equal(heroBoss.reward.xp, 450); assert.ok(heroBoss.reward.drops.length >= 1); assert.equal(heroBoss.save.stats.bossKills, 1);
 socketA.disconnect(); socketB.disconnect();
+const networkHealth = await json("/health/network");
+assert.equal(networkHealth.rates.bossSimulationHz,20);assert.equal(networkHealth.rates.worldSnapshotHz,15);assert.equal(networkHealth.rates.bossSnapshotHz,8);
+assert.ok(networkHealth.network.averageWorldSnapshotBytes>0);assert.ok(networkHealth.boss.acceptedPlayerHits>=4);
+assert.ok(counts.snapshots>0&&counts.bossStates>0&&counts.bossDamageBatches>0&&counts.bossPatterns>0&&counts.bossPhases>0);
 
 const shop = await json("/api/game/shop", auth(first.token, { kind: "potion", id: "meadow1", regionId: "meadow" }));
 assert.equal(shop.save.potions.meadow1, 4);
 const enhanced = await json("/api/game/enhance", auth(first.token, { itemId: shop.save.inventory[0].id, useGuard: false }));
 assert.ok(["success", "great", "keep", "drop"].includes(enhanced.result));
 
-const login = await json("/api/auth/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ username: `hero_${seed}`, password: "test-password-123" }) });
+const login = await json("/api/auth/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ username: `hero_${seed}`, password: "test-password-123", displayName:"" }) });
 const restored = (await json("/api/save", { headers: { authorization: `Bearer ${login.token}` } })).save;
 assert.equal(restored.gold, enhanced.save.gold); assert.equal(restored.stats.bossKills, 1); assert.equal(restored.inventory.length, enhanced.save.inventory.length);
-console.log("LIVE API CHECK PASSED: auth, protected save, server boss AI/reward, shop, enhancement, relogin restore, two-player presence");
+console.log("LIVE API CHECK PASSED", JSON.stringify({ auth:"cross-device",coopBossRewards:2,messages:counts,server:networkHealth }));

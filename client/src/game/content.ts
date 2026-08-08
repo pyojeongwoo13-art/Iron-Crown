@@ -20,7 +20,7 @@ export type DropEntry = { itemId: string; chance: number; legendChance: number; 
 export type GuaranteedDrop = { itemId: string; weight: number; legendChance: number };
 export type MonsterKind = "normal" | "elite" | "boss";
 export type MonsterBlueprint = {
-  id: string; name: string; regionId: string; kind: MonsterKind; hp: number; attack: number;
+  id: string; name: string; regionId: string; tier: number; kind: MonsterKind; hp: number; attack: number;
   xp: number; gold: [number, number]; radius: number; speed: number; color: string; accent: string;
   respawn: number; shape: string; attackStyle: AttackStyle; windup: number; cooldown: number;
   range: number; drops: DropEntry[]; guaranteed?: GuaranteedDrop[]; rareDrops?: DropEntry[];

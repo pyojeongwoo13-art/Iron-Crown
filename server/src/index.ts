@@ -13,23 +13,25 @@ import { createBossEngine, type BossPresence } from "./boss-engine.js";
 import { initializeDatabase, pool } from "./db.js";
 import { buyFromShop, enhanceOnServer, loadSave, mergeClientState, rewardForKill, writeSave } from "./game.js";
 import { initialSave, MONSTERS } from "../../client/src/game/content.js";
+import { NETWORK } from "../../client/src/game/network.js";
 
 const app = express(), server = http.createServer(app);
-const origins = (process.env.CLIENT_ORIGIN || "http://localhost:5173").split(",").map((value) => value.trim()).filter(Boolean);
-const allowedOrigin = (origin?: string) => !origin || origins.includes("*") || origins.includes(origin);
+const origins = (process.env.CLIENT_ORIGIN || "http://localhost:5173").split(",").map((value) => value.trim().replace(/\/$/, "")).filter(Boolean);
+const allowedOrigin = (origin?: string) => !origin || origins.includes("*") || origins.includes(origin.replace(/\/$/, "")) || /^https:\/\/[a-z0-9-]+\.github\.io$/i.test(origin);
 app.set("trust proxy", 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({ origin(origin, callback) { callback(allowedOrigin(origin) ? null : new Error("Origin blocked"), Boolean(origin)); } }));
 app.use(express.json({ limit: "256kb" }));
 app.use(rateLimit({ windowMs: 60_000, limit: 240, standardHeaders: true, legacyHeaders: false }));
 
-const authSchema = z.object({ username: z.string().trim().toLowerCase().regex(/^[a-z0-9_]{3,20}$/, "아이디는 영문 소문자, 숫자, _만 사용할 수 있습니다."), password: z.string().min(8, "비밀번호는 8자 이상이어야 합니다.").max(72), displayName: z.string().trim().min(1).max(16).optional() });
+const credentialSchema = z.object({ username: z.string().trim().toLowerCase().regex(/^[a-z0-9_]{3,20}$/, "아이디는 영문 소문자, 숫자, _만 사용할 수 있습니다."), password: z.string().min(8, "비밀번호는 8자 이상이어야 합니다.").max(72) });
+const registerSchema = credentialSchema.extend({ displayName: z.string().trim().min(1).max(16) });
 const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 25, standardHeaders: true, legacyHeaders: false });
 
 app.get("/health", (_request, response) => response.json({ ok: true, game: "IRON CROWN", time: Date.now() }));
 app.post("/api/auth/register", authLimiter, async (request, response) => {
-  const parsed = authSchema.safeParse(request.body);
-  if (!parsed.success || !parsed.data.displayName) return response.status(400).json({ error: parsed.success ? "캐릭터 이름을 입력하세요." : parsed.error.issues[0].message });
+  const parsed = registerSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: parsed.error.issues[0].message });
   const client = await pool.connect();
   try {
     const id = randomUUID(), passwordHash = await bcrypt.hash(parsed.data.password, 12), save = initialSave();
@@ -44,7 +46,8 @@ app.post("/api/auth/register", authLimiter, async (request, response) => {
 });
 
 app.post("/api/auth/login", authLimiter, async (request, response) => {
-  const parsed = authSchema.safeParse(request.body);
+  // 로그인은 회원가입 전용 displayName 필드를 검증하지 않는다. 이전 클라이언트의 빈 문자열도 안전하게 무시한다.
+  const parsed = credentialSchema.safeParse(request.body);
   if (!parsed.success) return response.status(400).json({ error: "아이디와 비밀번호를 확인하세요." });
   const result = await pool.query("SELECT id,username,display_name,password_hash FROM users WHERE username=$1", [parsed.data.username]);
   const row = result.rows[0];
@@ -95,8 +98,10 @@ app.post("/api/game/shop", requireAuth, async (request, response) => {
   finally { client.release(); }
 });
 
-type Presence = BossPresence & { id: string; maxHp: number; weapon: string };
+type Presence = BossPresence & { id: string; maxHp: number; weapon: string; level: number };
 const presence = new Map<string, Presence>();
+const networkMetrics = { presenceMessages: 0, worldSnapshots: 0, rosterBroadcasts: 0, onlineRosterBroadcasts: 0, worldSnapshotBytes: 0 };
+const dirtyRegions = new Set<string>(), regionSnapshotAt = new Map<string, number>();
 const io = new Server(server, { cors: { origin: origins.includes("*") ? true : origins, methods: ["GET", "POST"] }, pingInterval: 10_000, pingTimeout: 20_000 });
 const bossEngine = createBossEngine({
   io,
@@ -119,23 +124,56 @@ const bossEngine = createBossEngine({
     }
   },
 });
+const emitRoster = (region: string) => {
+  const players = [...presence.values()].filter((player) => player.region === region).map(({ id, name, maxHp, weapon, level }) => ({ id, name, maxHp, weapon, level }));
+  io.to(`region:${region}`).emit("world:roster", players); networkMetrics.rosterBroadcasts += 1;
+};
+const emitOnlineRoster = () => {
+  const players = [...presence.values()].map(({ id, name, maxHp, weapon, level, region }) => ({ id, name, maxHp, weapon, level, region }));
+  io.emit("online:roster", players); networkMetrics.onlineRosterBroadcasts += 1;
+};
 io.use((socket, next) => { try { socket.data.user = verifyToken(String(socket.handshake.auth?.token ?? "")); next(); } catch { next(new Error("unauthorized")); } });
 io.on("connection", (socket) => {
   const user = socket.data.user as AuthUser;
-  socket.on("presence", (raw: Record<string, unknown>) => {
+  socket.on("presence", async (raw: Record<string, unknown>) => {
+    networkMetrics.presenceMessages += 1;
     const number = (value: unknown, fallback: number, min: number, max: number) => Math.min(max, Math.max(min, typeof value === "number" && Number.isFinite(value) ? value : fallback));
-    const previous = presence.get(socket.id), now = Date.now(), x = number(raw.x, 520, 0, 4600), y = number(raw.y, 1400, 0, 2800), region = typeof raw.region === "string" ? raw.region.slice(0, 20) : "meadow";
+    const previous = presence.get(socket.id), now = Date.now(), x = number(raw.x, previous?.x ?? 520, 0, 4600), y = number(raw.y, previous?.y ?? 1400, 0, 2800), region = typeof raw.region === "string" ? raw.region.slice(0, 20) : previous?.region ?? "meadow";
     const elapsed = Math.max(.05, Math.min(.6, (now - (previous?.updatedAt ?? now)) / 1000));
     presence.set(socket.id, { id: socket.id, socketId: socket.id, userId: user.id, name: user.displayName, x, y,
       vx: previous?.region === region ? (x - previous.x) / elapsed : 0, vy: previous?.region === region ? (y - previous.y) / elapsed : 0,
-      hp: number(raw.hp, 1, 0, 1e12), maxHp: number(raw.maxHp, 100, 1, 1e12), weapon: typeof raw.weapon === "string" ? raw.weapon.slice(0, 90) : "맨손", region, updatedAt: now });
-    if (!previous || previous.region !== region) bossEngine.joinRegion(socket.id, previous?.region ?? null, region);
-    io.emit("world", [...presence.values()]);
+      hp: number(raw.hp, previous?.hp ?? 1, 0, 1e12), maxHp: number(raw.maxHp, previous?.maxHp ?? 100, 1, 1e12), weapon: typeof raw.weapon === "string" ? raw.weapon.slice(0, 90) : previous?.weapon ?? "맨손", level: number(raw.level, previous?.level ?? 1, 1, 75), region, updatedAt: now });
+    const current = presence.get(socket.id)!;
+    if (!previous || previous.region !== region || Math.abs(previous.x - x) >= .05 || Math.abs(previous.y - y) >= .05 || previous.hp !== current.hp) dirtyRegions.add(region);
+    if (previous?.region && previous.region !== region) dirtyRegions.add(previous.region);
+    const rosterChanged = !previous || previous.region !== region || previous.maxHp !== current.maxHp || previous.weapon !== current.weapon || previous.level !== current.level;
+    if (!previous || previous.region !== region) {
+      await bossEngine.joinRegion(socket.id, previous?.region ?? null, region);
+      if (previous) emitRoster(previous.region);
+    }
+    if (rosterChanged) { emitRoster(region); emitOnlineRoster(); }
   });
   socket.on("boss:engage", (raw: Record<string, unknown>) => bossEngine.engage(socket.id, typeof raw?.regionId === "string" ? raw.regionId : ""));
   socket.on("boss:damage", (raw: unknown) => bossEngine.damage(socket.id, raw));
-  socket.on("disconnect", () => { presence.delete(socket.id); io.emit("world", [...presence.values()]); });
+  socket.on("disconnect", () => { const previous = presence.get(socket.id); presence.delete(socket.id); bossEngine.removePlayer(socket.id); if (previous) { dirtyRegions.add(previous.region); emitRoster(previous.region); emitOnlineRoster(); } });
 });
+
+const worldTimer = setInterval(() => {
+  const now = Date.now(), byRegion = new Map<string, Presence[]>();
+  for (const player of presence.values()) {
+    if (now - player.updatedAt > 2_000) continue;
+    const group = byRegion.get(player.region) ?? []; group.push(player); byRegion.set(player.region, group);
+  }
+  for (const [region, players] of byRegion) {
+    if (!io.sockets.adapter.rooms.get(`region:${region}`)?.size) continue;
+    if (!dirtyRegions.has(region) && now - (regionSnapshotAt.get(region) ?? 0) < NETWORK.presenceHeartbeatMs) continue;
+    const payload = { t: now, p: players.map((player) => [player.id, Math.round(player.x * 10) / 10, Math.round(player.y * 10) / 10, Math.round(player.hp)] as const) };
+    io.to(`region:${region}`).emit("world:snapshot", payload); networkMetrics.worldSnapshots += 1; networkMetrics.worldSnapshotBytes += JSON.stringify(payload).length;
+    dirtyRegions.delete(region); regionSnapshotAt.set(region, now);
+  }
+}, 1000 / NETWORK.worldSnapshotHz);
+
+app.get("/health/network", (_request, response) => response.json({ ok: true, uptimeMs: Math.round(process.uptime() * 1000), network: { ...networkMetrics, averageWorldSnapshotBytes: networkMetrics.worldSnapshots ? Math.round(networkMetrics.worldSnapshotBytes / networkMetrics.worldSnapshots) : 0 }, boss: bossEngine.getMetrics(), rates: NETWORK }));
 
 app.use((_request, response) => response.status(404).json({ error: "not found" }));
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => { console.error(error); response.status(500).json({ error: "server error" }); });
