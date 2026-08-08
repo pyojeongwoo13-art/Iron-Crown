@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import IronCrownGame from "./components/IronCrownGame";
 import { buildAuthPayload } from "./game/auth";
 
@@ -11,33 +11,34 @@ export default function App() {
     try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "null"); } catch { return null; }
   });
   const [checking, setChecking] = useState(Boolean(session));
+  const [sessionMessage,setSessionMessage]=useState("");
 
   useEffect(() => {
     if (!session) { setChecking(false); return; }
     fetch(`${apiUrl}/api/auth/me`, { headers: { authorization: `Bearer ${session.token}` } })
       .then(async (response) => {
-        if (!response.ok) throw new Error("expired");
+        if (!response.ok) { const data=await response.json().catch(()=>({}));throw new Error(data.error||"로그인이 만료되었습니다."); }
         const data = await response.json();
         const next = { token: session.token, player: data.player };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
         setSession(next);
       })
-      .catch(() => { localStorage.removeItem(STORAGE_KEY); setSession(null); })
+      .catch((error) => { localStorage.removeItem(STORAGE_KEY); setSession(null);setSessionMessage(error instanceof Error?error.message:""); })
       .finally(() => setChecking(false));
   }, [apiUrl]);
 
-  const logout = () => { localStorage.removeItem(STORAGE_KEY); setSession(null); };
+  const logout = useCallback((reason?:string) => { localStorage.removeItem(STORAGE_KEY); setSession(null);setSessionMessage(reason??""); },[]);
   if (checking) return <div className="account-shell"><div className="server-wake"><span>♛</span><b>IRON CROWN</b><p>서버에서 모험을 불러오는 중…</p></div></div>;
-  if (!session) return <AccountScreen apiUrl={apiUrl} onSession={(next) => { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); setSession(next); }} />;
+  if (!session) return <AccountScreen apiUrl={apiUrl} initialMessage={sessionMessage} onSession={(next) => { localStorage.setItem(STORAGE_KEY, JSON.stringify(next));setSessionMessage("");setSession(next); }} />;
   return <IronCrownGame playerName={session.player.displayName} apiUrl={apiUrl} token={session.token} onLogout={logout} />;
 }
 
-function AccountScreen({ apiUrl, onSession }: { apiUrl: string; onSession: (session: Session) => void }) {
+function AccountScreen({ apiUrl, initialMessage, onSession }: { apiUrl: string; initialMessage:string; onSession: (session: Session) => void }) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
+  const [error, setError] = useState(initialMessage);
   const [busy, setBusy] = useState(false);
   const [serverState,setServerState]=useState<"checking"|"online"|"offline">("checking");
 

@@ -3,10 +3,10 @@ export const NETWORK = {
   presenceHeartbeatMs: 600,
   worldSnapshotHz: 15,
   bossSimulationHz: 20,
-  bossSnapshotHz: 8,
+  bossSnapshotHz: 12,
   bossDamageBroadcastHz: 12,
   remoteSmoothRate: 18,
-  bossSmoothRate: 16,
+  bossSmoothRate: 18,
   teleportSnapDistance: 420,
   movementEpsilon: .6,
 } as const;
@@ -26,4 +26,9 @@ export function smoothPosition(current: NetworkPosition, target: NetworkPosition
 
 export function positionChanged(previous: NetworkPosition | null, next: NetworkPosition, epsilon: number = NETWORK.movementEpsilon) {
   return !previous || Math.abs(previous.x - next.x) >= epsilon || Math.abs(previous.y - next.y) >= epsilon;
+}
+
+export function cameraZoomFor(width: number, height: number, coarsePointer: boolean) {
+  if (height <= 500 || coarsePointer || width < 760) return .8;
+  return 1;
 }

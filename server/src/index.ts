@@ -8,7 +8,7 @@ import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import { Server } from "socket.io";
 import { z } from "zod";
-import { createToken, requireAuth, verifyToken, type AuthUser } from "./auth.js";
+import { createToken, isActiveSession, requireAuth, verifyToken, type AuthUser } from "./auth.js";
 import { createBossEngine, type BossPresence } from "./boss-engine.js";
 import { initializeDatabase, pool } from "./db.js";
 import { buyFromShop, enhanceOnServer, loadSave, mergeClientState, rewardForKill, writeSave } from "./game.js";
@@ -34,12 +34,12 @@ app.post("/api/auth/register", authLimiter, async (request, response) => {
   if (!parsed.success) return response.status(400).json({ error: parsed.error.issues[0].message });
   const client = await pool.connect();
   try {
-    const id = randomUUID(), passwordHash = await bcrypt.hash(parsed.data.password, 12), save = initialSave();
+    const id = randomUUID(), sessionId = randomUUID(), passwordHash = await bcrypt.hash(parsed.data.password, 12), save = initialSave();
     await client.query("BEGIN");
-    await client.query("INSERT INTO users(id,username,display_name,password_hash) VALUES($1,$2,$3,$4)", [id, parsed.data.username, parsed.data.displayName, passwordHash]);
+    await client.query("INSERT INTO users(id,username,display_name,password_hash,active_session_id) VALUES($1,$2,$3,$4,$5)", [id, parsed.data.username, parsed.data.displayName, passwordHash, sessionId]);
     await client.query("INSERT INTO saves(user_id,save_json,version) VALUES($1,$2,2)", [id, JSON.stringify(save)]);
     await client.query("COMMIT");
-    const player = { id, username: parsed.data.username, displayName: parsed.data.displayName };
+    const player = { id, username: parsed.data.username, displayName: parsed.data.displayName, sessionId };
     response.status(201).json({ token: createToken(player), player: { username: player.username, displayName: player.displayName } });
   } catch (error: any) { await client.query("ROLLBACK"); response.status(error?.code === "23505" ? 409 : 500).json({ error: error?.code === "23505" ? "이미 사용 중인 아이디입니다." : "계정을 만들지 못했습니다." }); }
   finally { client.release(); }
@@ -52,8 +52,13 @@ app.post("/api/auth/login", authLimiter, async (request, response) => {
   const result = await pool.query("SELECT id,username,display_name,password_hash FROM users WHERE username=$1", [parsed.data.username]);
   const row = result.rows[0];
   if (!row || !(await bcrypt.compare(parsed.data.password, row.password_hash))) return response.status(401).json({ error: "아이디 또는 비밀번호가 맞지 않습니다." });
-  await pool.query("UPDATE users SET last_login_at=NOW() WHERE id=$1", [row.id]);
-  const player = { id: row.id, username: row.username, displayName: row.display_name };
+  const sessionId = randomUUID();
+  await pool.query("UPDATE users SET last_login_at=NOW(),active_session_id=$2 WHERE id=$1", [row.id, sessionId]);
+  for (const connected of io.sockets.sockets.values()) if ((connected.data.user as AuthUser | undefined)?.id === row.id) {
+    connected.emit("session:replaced", { message: "다른 기기에서 로그인되어 현재 접속이 종료되었습니다." });
+    setTimeout(() => connected.disconnect(true), 40);
+  }
+  const player = { id: row.id, username: row.username, displayName: row.display_name, sessionId };
   response.json({ token: createToken(player), player: { username: player.username, displayName: player.displayName } });
 });
 
@@ -132,7 +137,7 @@ const emitOnlineRoster = () => {
   const players = [...presence.values()].map(({ id, name, maxHp, weapon, level, region }) => ({ id, name, maxHp, weapon, level, region }));
   io.emit("online:roster", players); networkMetrics.onlineRosterBroadcasts += 1;
 };
-io.use((socket, next) => { try { socket.data.user = verifyToken(String(socket.handshake.auth?.token ?? "")); next(); } catch { next(new Error("unauthorized")); } });
+io.use(async (socket, next) => { try { const user = verifyToken(String(socket.handshake.auth?.token ?? "")); if (!(await isActiveSession(user))) return next(new Error("session replaced")); socket.data.user = user; next(); } catch { next(new Error("unauthorized")); } });
 io.on("connection", (socket) => {
   const user = socket.data.user as AuthUser;
   socket.on("presence", async (raw: Record<string, unknown>) => {
@@ -154,6 +159,7 @@ io.on("connection", (socket) => {
     if (rosterChanged) { emitRoster(region); emitOnlineRoster(); }
   });
   socket.on("boss:engage", (raw: Record<string, unknown>) => bossEngine.engage(socket.id, typeof raw?.regionId === "string" ? raw.regionId : ""));
+  socket.on("boss:leave", () => bossEngine.leave(socket.id, "death"));
   socket.on("boss:damage", (raw: unknown) => bossEngine.damage(socket.id, raw));
   socket.on("disconnect", () => { const previous = presence.get(socket.id); presence.delete(socket.id); bossEngine.removePlayer(socket.id); if (previous) { dirtyRegions.add(previous.region); emitRoster(previous.region); emitOnlineRoster(); } });
 });

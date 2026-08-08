@@ -29,3 +29,26 @@ test("two players damage one authoritative boss and both receive contributor rew
   assert.ok(events.some(event=>event.room==="region:meadow"&&event.name==="boss:defeated"));
   assert.ok(engine.getMetrics().acceptedPlayerHits>=8);
 });
+
+test("arena participation is individual and a full wipe resets once on the server timeline", async () => {
+  const { createBossEngine } = await import(`../server/dist/server/src/boss-engine.js?wipe=${Date.now()}`);
+  const events=[],rooms=new Map([["region:meadow",new Set(["socket-a","socket-b"])]]),players=[
+    {socketId:"socket-a",userId:"user-a",name:"참가자",x:3820,y:1200,vx:0,vy:0,hp:100,region:"meadow",updatedAt:Date.now()},
+    {socketId:"socket-b",userId:"user-b",name:"관전자",x:3890,y:1280,vx:0,vy:0,hp:100,region:"meadow",updatedAt:Date.now()},
+  ];
+  const fakeIo={sockets:{adapter:{rooms},sockets:new Map()},to(room){return{emit(name,payload){events.push({room,name,payload})}}}};
+  const engine=createBossEngine({io:fakeIo,getPresence:()=>players,onDefeat:async()=>{}}),fresh=engine.snapshotFor("meadow");
+  const freshness=setInterval(()=>{for(const player of players)player.updatedAt=Date.now()},100);
+  try {
+    engine.engage("socket-a","meadow");
+    await new Promise(resolve=>setTimeout(resolve,1450));
+    engine.damage("socket-a",{regionId:"meadow",damage:200});
+    const damaged=engine.snapshotFor("meadow");assert.ok(damaged.hp<fresh.hp);
+    assert.ok(events.some(event=>event.room==="socket-a"&&event.name==="boss:participation"&&event.payload.locked));
+    assert.ok(!events.some(event=>event.room==="socket-b"&&event.name==="boss:participation"&&event.payload.locked));
+    const pattern=events.find(event=>event.name==="boss:pattern");assert.ok(pattern?.payload.timeline);assert.ok(pattern.payload.timeline.resolveAt>=pattern.payload.timeline.warnAt);assert.ok(pattern.payload.timeline.serverNow);
+    engine.leave("socket-a","death");
+    await new Promise(resolve=>setTimeout(resolve,900));
+    const resetEvents=events.filter(event=>event.name==="boss:reset");assert.equal(resetEvents.length,1);assert.equal(engine.snapshotFor("meadow").hp,fresh.hp);
+  } finally { clearInterval(freshness);engine.stop(); }
+});

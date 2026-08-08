@@ -1,7 +1,7 @@
 {
   "name": "iron-crown-online",
   "private": true,
-  "version": "3.0.0",
+  "version": "4.0.0",
   "scripts": {
     "install:all": "npm ci --prefix client && npm ci --prefix server",
     "build": "VITE_API_URL=https://example.onrender.com VITE_BASE_PATH=/iron-crown/ npm run build --prefix client && npm run build --prefix server",

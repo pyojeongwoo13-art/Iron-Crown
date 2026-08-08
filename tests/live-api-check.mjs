@@ -60,7 +60,7 @@ const rewards = await bossRewards; clearInterval(damageTimer); clearInterval(pre
 const heroBoss = rewards.get("a"); assert.equal(heroBoss.reward.xp, 450); assert.ok(heroBoss.reward.drops.length >= 1); assert.equal(heroBoss.save.stats.bossKills, 1);
 socketA.disconnect(); socketB.disconnect();
 const networkHealth = await json("/health/network");
-assert.equal(networkHealth.rates.bossSimulationHz,20);assert.equal(networkHealth.rates.worldSnapshotHz,15);assert.equal(networkHealth.rates.bossSnapshotHz,8);
+assert.equal(networkHealth.rates.bossSimulationHz,20);assert.equal(networkHealth.rates.worldSnapshotHz,15);assert.equal(networkHealth.rates.bossSnapshotHz,12);
 assert.ok(networkHealth.network.averageWorldSnapshotBytes>0);assert.ok(networkHealth.boss.acceptedPlayerHits>=4);
 assert.ok(counts.snapshots>0&&counts.bossStates>0&&counts.bossDamageBatches>0&&counts.bossPatterns>0&&counts.bossPhases>0);
 
@@ -69,7 +69,13 @@ assert.equal(shop.save.potions.meadow1, 4);
 const enhanced = await json("/api/game/enhance", auth(first.token, { itemId: shop.save.inventory[0].id, useGuard: false }));
 assert.ok(["success", "great", "keep", "drop"].includes(enhanced.result));
 
+const staleSocket=io(base,{auth:{token:first.token},transports:["websocket"]});
+await new Promise((resolve,reject)=>{const timeout=setTimeout(()=>reject(new Error("replacement socket connect timeout")),3000);staleSocket.on("connect",()=>{clearTimeout(timeout);resolve()});staleSocket.on("connect_error",reject)});
+const replacementNotice=new Promise((resolve,reject)=>{const timeout=setTimeout(()=>reject(new Error("session replacement notice timeout")),3000);staleSocket.on("session:replaced",payload=>{clearTimeout(timeout);resolve(payload)})});
 const login = await json("/api/auth/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ username: `hero_${seed}`, password: "test-password-123", displayName:"" }) });
+assert.match((await replacementNotice).message,/다른 기기/);staleSocket.disconnect();
+const replaced = await fetch(`${base}/api/save`, { headers: { authorization: `Bearer ${first.token}` } });
+assert.equal(replaced.status,401);assert.equal((await replaced.json()).code,"SESSION_REPLACED");
 const restored = (await json("/api/save", { headers: { authorization: `Bearer ${login.token}` } })).save;
 assert.equal(restored.gold, enhanced.save.gold); assert.equal(restored.stats.bossKills, 1); assert.equal(restored.inventory.length, enhanced.save.inventory.length);
 console.log("LIVE API CHECK PASSED", JSON.stringify({ auth:"cross-device",coopBossRewards:2,messages:counts,server:networkHealth }));

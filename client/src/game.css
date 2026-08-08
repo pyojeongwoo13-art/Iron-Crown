@@ -15,6 +15,7 @@ button:focus-visible { outline:3px solid #80e8ff; outline-offset:3px; }
 .resource span,.resource b,.online-counter { min-height:37px; display:flex; align-items:center; gap:6px; padding:0 13px; border:1px solid var(--line); border-radius:11px; background:#14241fe6; font-size:13px; font-style:normal; }
 .resource span { color:#fff3b6; font-weight:900; }.resource b{color:#ffd86c}.online-counter{color:#c2d2c7;cursor:pointer}.online-counter u{text-decoration:none}.online-dot{display:inline-block;width:7px;height:7px;flex:0 0 auto;border-radius:99px;background:#68f49a;box-shadow:0 0 10px #68f49a;}
 .icon-btn { width:38px;height:38px;border:1px solid var(--line);border-radius:11px;background:#14241fe6;cursor:pointer;pointer-events:auto;font-size:17px; }
+.reset-btn{color:#ffd989;border-color:#e5b95c55;font-weight:900}
 
 .status-hud { position:absolute; top:80px; left:18px; display:flex; align-items:center; gap:9px; padding:8px 10px; border:1px solid var(--line); border-radius:16px; background:linear-gradient(135deg,rgba(13,26,22,.94),rgba(24,43,35,.88)); box-shadow:0 8px 25px #0a181144; }
 .portrait { width:49px;height:49px;display:grid;place-items:center;border:2px solid #d8b760;border-radius:12px;background:#263d36;color:#ffe39a;font-size:23px; }

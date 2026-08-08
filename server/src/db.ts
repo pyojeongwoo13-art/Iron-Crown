@@ -46,4 +46,6 @@ export async function initializeDatabase() {
     );
     CREATE INDEX IF NOT EXISTS saves_updated_at_idx ON saves(updated_at);
   `);
+  try { await pool.query("ALTER TABLE users ADD COLUMN active_session_id TEXT"); }
+  catch (error) { if ((error as { code?: string }).code !== "42701") throw error; }
 }

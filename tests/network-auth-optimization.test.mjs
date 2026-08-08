@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildAuthPayload } from "../client/src/game/auth.ts";
-import { NETWORK, positionChanged, smoothPosition } from "../client/src/game/network.ts";
+import { NETWORK, cameraZoomFor, positionChanged, smoothPosition } from "../client/src/game/network.ts";
 import { bossArmorForTier, bossDamageAfterDefense } from "../client/src/game/combat.ts";
 import { ITEMS, MONSTERS, itemFinalStat } from "../client/src/game/content.ts";
 
@@ -24,6 +24,14 @@ test("presence sender can suppress idle frames while preserving a heartbeat", ()
   assert.ok(NETWORK.presenceSendHz>=15&&NETWORK.presenceSendHz<=20);
   assert.ok(NETWORK.worldSnapshotHz>=10&&NETWORK.worldSnapshotHz<=20);
   assert.ok(NETWORK.bossSnapshotHz<NETWORK.bossSimulationHz);
+});
+
+test("mobile world camera zoom keeps HUD coordinates separate", () => {
+  assert.equal(cameraZoomFor(390,844,true),.8);
+  assert.equal(cameraZoomFor(844,390,true),.8);
+  assert.equal(cameraZoomFor(740,360,false),.8);
+  assert.equal(cameraZoomFor(1366,768,false),1);
+  assert.equal(NETWORK.bossSnapshotHz,12);
 });
 
 test("boss defense preserves weapon and +30 enhancement growth without a boss HP cap", () => {
@@ -66,6 +74,16 @@ test("server login ignores legacy empty display names", async () => {
   const source=await import("node:fs/promises").then(fs=>fs.readFile(new URL("../server/src/index.ts",import.meta.url),"utf8"));
   assert.match(source,/const credentialSchema/);
   assert.match(source,/api\/auth\/login[\s\S]*credentialSchema\.safeParse/);
+});
+
+test("single active session and participant-only arena seal are wired", async () => {
+  const [server,auth,client]=await Promise.all([
+    import("node:fs/promises").then(fs=>fs.readFile(new URL("../server/src/index.ts",import.meta.url),"utf8")),
+    import("node:fs/promises").then(fs=>fs.readFile(new URL("../server/src/auth.ts",import.meta.url),"utf8")),
+    import("node:fs/promises").then(fs=>fs.readFile(new URL("../client/src/components/IronCrownGame.tsx",import.meta.url),"utf8")),
+  ]);
+  assert.match(server,/active_session_id/);assert.match(server,/session:replaced/);assert.match(auth,/isActiveSession/);
+  assert.match(client,/localArenaLockedRef/);assert.match(client,/boss:participation/);assert.match(client,/cameraZoomRef/);
 });
 
 test("boss death and respawn paths clear temporary attacks before reset", async () => {
