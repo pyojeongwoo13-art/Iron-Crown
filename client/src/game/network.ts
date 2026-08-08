@@ -29,6 +29,7 @@ export function positionChanged(previous: NetworkPosition | null, next: NetworkP
 }
 
 export function cameraZoomFor(width: number, height: number, coarsePointer: boolean) {
-  if (height <= 500 || coarsePointer || width < 760) return .8;
+  if (height <= 500 && width <= 1000) return .55;
+  if (coarsePointer) return .8;
   return 1;
 }

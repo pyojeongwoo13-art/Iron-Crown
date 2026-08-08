@@ -39,7 +39,7 @@ export function sanitizeStoredSave(raw: unknown): SaveData {
   const equipped = { ...base.equipped };
   for (const slot of slots) {
     const wanted = value.equipped?.[slot];
-    equipped[slot] = typeof wanted === "string" && ids.has(wanted) && inventory.find((item) => item.id === wanted)?.slot === slot ? wanted : inventory.find((item) => item.slot === slot)?.id ?? null;
+    equipped[slot] = typeof wanted === "string" && ids.has(wanted) && inventory.find((item) => item.id === wanted)?.slot === slot ? wanted : slot === "weapon" ? inventory.find((item) => item.slot === "weapon")?.id ?? null : null;
   }
   const save: SaveData = {
     version: 2,
@@ -83,6 +83,16 @@ export async function loadSave(client: PoolClient, userId: string, lock = false)
 export async function writeSave(client: PoolClient, userId: string, save: SaveData) {
   save.updatedAt = Date.now();
   await client.query("UPDATE saves SET save_json=$2, version=2, updated_at=NOW() WHERE user_id=$1", [userId, JSON.stringify(save)]);
+}
+
+export function deleteItemFromSave(save: SaveData, itemId: string) {
+  const item = save.inventory.find((candidate) => candidate.id === itemId);
+  if (!item) throw new Error("존재하지 않는 장비입니다.");
+  if (item.slot === "weapon" && save.inventory.filter((candidate) => candidate.slot === "weapon").length <= 1) throw new Error("마지막 무기는 삭제할 수 없습니다.");
+  if (save.equipped[item.slot] === item.id) throw new Error("현재 장착 중인 장비는 삭제할 수 없습니다. 먼저 다른 장비를 장착해 주세요.");
+  save.inventory = save.inventory.filter((candidate) => candidate.id !== item.id);
+  save.updatedAt = Date.now();
+  return item;
 }
 
 function rollItem(catalogId: string, legendChance: number) {

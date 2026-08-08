@@ -11,7 +11,7 @@ import { z } from "zod";
 import { createToken, isActiveSession, requireAuth, verifyToken, type AuthUser } from "./auth.js";
 import { createBossEngine, type BossPresence } from "./boss-engine.js";
 import { initializeDatabase, pool } from "./db.js";
-import { buyFromShop, enhanceOnServer, loadSave, mergeClientState, rewardForKill, writeSave } from "./game.js";
+import { buyFromShop, deleteItemFromSave, enhanceOnServer, loadSave, mergeClientState, rewardForKill, writeSave } from "./game.js";
 import { initialSave, MONSTERS } from "../../client/src/game/content.js";
 import { NETWORK } from "../../client/src/game/network.js";
 
@@ -101,6 +101,23 @@ app.post("/api/game/shop", requireAuth, async (request, response) => {
   try { await client.query("BEGIN"); const save = await loadSave(client, request.user!.id, true); buyFromShop(save, String(request.body?.kind ?? ""), String(request.body?.id ?? ""), String(request.body?.regionId ?? "")); await writeSave(client, request.user!.id, save); await client.query("COMMIT"); response.json({ save }); }
   catch (error) { await client.query("ROLLBACK"); response.status(400).json({ error: error instanceof Error ? error.message : "구매에 실패했습니다." }); }
   finally { client.release(); }
+});
+
+app.post("/api/game/delete-item", requireAuth, async (request, response) => {
+  const itemId = typeof request.body?.itemId === "string" ? request.body.itemId : "";
+  if (!itemId) return response.status(400).json({ error: "삭제할 장비를 선택하세요." });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const save = await loadSave(client, request.user!.id, true);
+    const deleted = deleteItemFromSave(save, itemId);
+    await writeSave(client, request.user!.id, save);
+    await client.query("COMMIT");
+    response.json({ save, deleted: { id: deleted.id, name: deleted.name } });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    response.status(409).json({ error: error instanceof Error ? error.message : "장비를 삭제하지 못했습니다." });
+  } finally { client.release(); }
 });
 
 type Presence = BossPresence & { id: string; maxHp: number; weapon: string; level: number };

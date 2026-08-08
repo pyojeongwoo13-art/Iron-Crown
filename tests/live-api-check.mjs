@@ -58,6 +58,9 @@ await new Promise(resolve=>setTimeout(resolve,1_800));
 const damageTimer = setInterval(() => { socketA.emit("boss:damage", { regionId: "meadow", damage: 200 }); socketB.emit("boss:damage", { regionId: "meadow", damage: 200 }); }, 120);
 const rewards = await bossRewards; clearInterval(damageTimer); clearInterval(presenceTimer);
 const heroBoss = rewards.get("a"); assert.equal(heroBoss.reward.xp, 450); assert.ok(heroBoss.reward.drops.length >= 1); assert.equal(heroBoss.save.stats.bossKills, 1);
+const disposable=heroBoss.reward.drops[0],deletion=await json("/api/game/delete-item",auth(first.token,{itemId:disposable.id}));assert.ok(!deletion.save.inventory.some(item=>item.id===disposable.id));
+const duplicateDelete=await fetch(`${base}/api/game/delete-item`,auth(first.token,{itemId:disposable.id}));assert.equal(duplicateDelete.status,409);
+const savedAfterDelete=(await json("/api/save",{headers:{authorization:`Bearer ${first.token}`}})).save;assert.ok(!savedAfterDelete.inventory.some(item=>item.id===disposable.id));
 socketA.disconnect(); socketB.disconnect();
 const networkHealth = await json("/health/network");
 assert.equal(networkHealth.rates.bossSimulationHz,20);assert.equal(networkHealth.rates.worldSnapshotHz,15);assert.equal(networkHealth.rates.bossSnapshotHz,12);
@@ -69,6 +72,10 @@ assert.equal(shop.save.potions.meadow1, 4);
 const enhanced = await json("/api/game/enhance", auth(first.token, { itemId: shop.save.inventory[0].id, useGuard: false }));
 assert.ok(["success", "great", "keep", "drop"].includes(enhanced.result));
 
+const equippedDelete=await fetch(`${base}/api/game/delete-item`,auth(first.token,{itemId:enhanced.save.equipped.weapon}));assert.equal(equippedDelete.status,409);
+const allySave=(await json("/api/save",{headers:{authorization:`Bearer ${second.token}`}})).save;
+const foreignDelete=await fetch(`${base}/api/game/delete-item`,auth(first.token,{itemId:allySave.inventory[0].id}));assert.equal(foreignDelete.status,409);
+
 const staleSocket=io(base,{auth:{token:first.token},transports:["websocket"]});
 await new Promise((resolve,reject)=>{const timeout=setTimeout(()=>reject(new Error("replacement socket connect timeout")),3000);staleSocket.on("connect",()=>{clearTimeout(timeout);resolve()});staleSocket.on("connect_error",reject)});
 const replacementNotice=new Promise((resolve,reject)=>{const timeout=setTimeout(()=>reject(new Error("session replacement notice timeout")),3000);staleSocket.on("session:replaced",payload=>{clearTimeout(timeout);resolve(payload)})});
@@ -77,5 +84,5 @@ assert.match((await replacementNotice).message,/다른 기기/);staleSocket.disc
 const replaced = await fetch(`${base}/api/save`, { headers: { authorization: `Bearer ${first.token}` } });
 assert.equal(replaced.status,401);assert.equal((await replaced.json()).code,"SESSION_REPLACED");
 const restored = (await json("/api/save", { headers: { authorization: `Bearer ${login.token}` } })).save;
-assert.equal(restored.gold, enhanced.save.gold); assert.equal(restored.stats.bossKills, 1); assert.equal(restored.inventory.length, enhanced.save.inventory.length);
+assert.equal(restored.gold, enhanced.save.gold); assert.equal(restored.stats.bossKills, 1); assert.equal(restored.inventory.length, enhanced.save.inventory.length);assert.ok(!restored.inventory.some(item=>item.id===disposable.id));
 console.log("LIVE API CHECK PASSED", JSON.stringify({ auth:"cross-device",coopBossRewards:2,messages:counts,server:networkHealth }));

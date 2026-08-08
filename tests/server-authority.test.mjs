@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { initialSave } from "../client/src/game/content.ts";
-import { buyFromShop, enhanceOnServer, mergeClientState, rewardForKill } from "../server/dist/server/src/game.js";
+import { createEquipment, initialSave } from "../client/src/game/content.ts";
+import { buyFromShop, deleteItemFromSave, enhanceOnServer, mergeClientState, rewardForKill } from "../server/dist/server/src/game.js";
 
 test("normal save sync cannot invent gold, XP, levels, items, or enhancements", () => {
   const current = initialSave(), starter = current.inventory[0];
@@ -36,4 +36,17 @@ test("shop validates current region and subtracts server gold", () => {
   buyFromShop(save, "potion", "meadow1", "meadow");
   assert.equal(save.gold, before - 20); assert.equal(save.potions.meadow1, 4);
   assert.throws(() => buyFromShop(save, "potion", "forest1", "meadow"), /판매하지 않는/);
+});
+
+test("server-authoritative item deletion protects equipped and final weapons", () => {
+  const save=initialSave(),starter=save.inventory[0],gold=save.gold;
+  const normal=createEquipment("hornMace",false),legendary=createEquipment("hornMace",true),enhanced={...createEquipment("hornMace",false),enhance:20};
+  save.inventory.push(normal,legendary,enhanced);
+  assert.throws(()=>deleteItemFromSave(save,starter.id),/장착 중/);
+  assert.equal(deleteItemFromSave(save,normal.id).id,normal.id);
+  assert.equal(deleteItemFromSave(save,legendary.id).rarity,"legendary");
+  assert.equal(deleteItemFromSave(save,enhanced.id).enhance,20);
+  assert.equal(save.gold,gold);assert.throws(()=>deleteItemFromSave(save,normal.id),/존재하지 않는/);
+  save.equipped.weapon=null;assert.throws(()=>deleteItemFromSave(save,starter.id),/마지막 무기/);
+  assert.equal(save.inventory.length,1);
 });

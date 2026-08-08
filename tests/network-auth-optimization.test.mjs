@@ -27,10 +27,10 @@ test("presence sender can suppress idle frames while preserving a heartbeat", ()
 });
 
 test("mobile world camera zoom keeps HUD coordinates separate", () => {
-  assert.equal(cameraZoomFor(390,844,true),.8);
-  assert.equal(cameraZoomFor(844,390,true),.8);
-  assert.equal(cameraZoomFor(740,360,false),.8);
-  assert.equal(cameraZoomFor(1366,768,false),1);
+  for(const [width,height] of [[740,360],[800,360],[844,390],[915,412]])assert.equal(cameraZoomFor(width,height,true),.55,`${width}x${height}`);
+  for(const [width,height] of [[1024,768],[1280,800]])assert.equal(cameraZoomFor(width,height,true),.8,`${width}x${height}`);
+  for(const [width,height] of [[1366,768],[1920,1080]])assert.equal(cameraZoomFor(width,height,false),1,`${width}x${height}`);
+  assert.equal(844/cameraZoomFor(844,390,true),1534.5454545454545);
   assert.equal(NETWORK.bossSnapshotHz,12);
 });
 
@@ -84,6 +84,12 @@ test("single active session and participant-only arena seal are wired", async ()
   ]);
   assert.match(server,/active_session_id/);assert.match(server,/session:replaced/);assert.match(auth,/isActiveSession/);
   assert.match(client,/localArenaLockedRef/);assert.match(client,/boss:participation/);assert.match(client,/cameraZoomRef/);
+});
+
+test("dangerous actions use the in-game confirm modal, never browser confirm", async () => {
+  const client=await import("node:fs/promises").then(fs=>fs.readFile(new URL("../client/src/components/IronCrownGame.tsx",import.meta.url),"utf8"));
+  assert.doesNotMatch(client,/\b(?:window\.)?confirm\s*\(/);assert.doesNotMatch(client,/\b(?:window\.)?alert\s*\(/);
+  assert.match(client,/function GameConfirmModal/);assert.match(client,/onCancel/);assert.match(client,/confirmBusy/);assert.match(client,/role="dialog"/);
 });
 
 test("boss death and respawn paths clear temporary attacks before reset", async () => {
